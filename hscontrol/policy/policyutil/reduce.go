@@ -1,8 +1,11 @@
 package policyutil
 
 import (
+	"net/netip"
+
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 )
 
@@ -18,6 +21,7 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 	for _, rule := range rules {
 		// record if the rule is actually relevant for the given node.
 		var dests []tailcfg.NetPortRange
+		var capGrants []tailcfg.CapGrant
 
 	DEST_LOOP:
 		for _, dest := range rule.DstPorts {
@@ -59,14 +63,69 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 			}
 		}
 
-		if len(dests) > 0 {
+		for _, grant := range rule.CapGrant {
+			var matchedDsts []netip.Prefix
+
+			for _, dst := range grant.Dsts {
+				if grantMatchesNodePrefix(node, dst) {
+					matchedDsts = append(matchedDsts, dst)
+				}
+			}
+
+			if len(matchedDsts) > 0 {
+				capGrants = append(capGrants, tailcfg.CapGrant{
+					Dsts:   matchedDsts,
+					Caps:   grant.Caps,
+					CapMap: grant.CapMap,
+				})
+			}
+		}
+
+		if len(dests) > 0 || len(capGrants) > 0 {
 			ret = append(ret, tailcfg.FilterRule{
 				SrcIPs:   rule.SrcIPs,
 				DstPorts: dests,
 				IPProto:  rule.IPProto,
+				CapGrant: capGrants,
 			})
 		}
 	}
 
 	return ret
+}
+
+func prefixesOverlap(a, b netip.Prefix) bool {
+	return a.Contains(b.Addr()) || b.Contains(a.Addr())
+}
+
+func grantMatchesNodePrefix(node types.NodeView, dst netip.Prefix) bool {
+	if node.InIPSet(mustIPSetFromPrefix(dst)) {
+		return true
+	}
+
+	if node.Hostinfo().Valid() {
+		routableIPs := node.Hostinfo().RoutableIPs()
+		if routableIPs.Len() > 0 {
+			for _, routableIP := range routableIPs.All() {
+				if prefixesOverlap(dst, routableIP) {
+					return true
+				}
+			}
+		}
+	}
+
+	for _, subnetRoute := range node.SubnetRoutes() {
+		if prefixesOverlap(dst, subnetRoute) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func mustIPSetFromPrefix(prefix netip.Prefix) *netipx.IPSet {
+	var builder netipx.IPSetBuilder
+	builder.AddPrefix(prefix)
+	set, _ := builder.IPSet()
+	return set
 }

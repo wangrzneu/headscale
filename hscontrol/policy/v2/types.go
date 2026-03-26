@@ -110,6 +110,9 @@ var (
 	ErrUnknownSSHSrcAlias          = errors.New("unknown SSH source alias type")
 	ErrUnknownField                = errors.New("unknown field")
 	ErrProtocolNoSpecificPorts     = errors.New("protocol does not support specific ports")
+	ErrGrantNeedsIPOrApp           = errors.New("grant must contain ip or app")
+	ErrGrantIPUnsupported          = errors.New("grant ip rules are not supported yet")
+	ErrEmptyCapabilityName         = errors.New("app capability name must not be empty")
 )
 
 type Asterix int
@@ -1590,6 +1593,15 @@ type ACL struct {
 	Destinations []AliasWithPorts `json:"dst"`
 }
 
+type Grant struct {
+	Sources      Aliases              `json:"src"`
+	Destinations Aliases              `json:"dst"`
+	IPs          []tailcfg.RawMessage `json:"ip,omitempty"`
+	App          AppCapabilities      `json:"app,omitempty"`
+}
+
+type AppCapabilities map[tailcfg.PeerCapability][]tailcfg.RawMessage
+
 // UnmarshalJSON implements custom unmarshalling for ACL that ignores fields starting with '#'.
 // headscale-admin uses # in some field names to add metadata, so we will ignore
 // those to ensure it doesnt break.
@@ -1649,6 +1661,7 @@ type Policy struct {
 	Hosts         Hosts              `json:"hosts,omitempty"`
 	TagOwners     TagOwners          `json:"tagOwners,omitempty"`
 	ACLs          []ACL              `json:"acls,omitempty"`
+	Grants        []Grant            `json:"grants,omitempty"`
 	AutoApprovers AutoApproverPolicy `json:"autoApprovers"`
 	SSHs          []SSH              `json:"ssh,omitempty"`
 }
@@ -1952,6 +1965,91 @@ func (p *Policy) validate() error {
 		err := validateACLSrcDstCombination(acl.Sources, acl.Destinations)
 		if err != nil {
 			errs = append(errs, err)
+		}
+	}
+
+	for _, grant := range p.Grants {
+		if len(grant.IPs) == 0 && len(grant.App) == 0 {
+			errs = append(errs, ErrGrantNeedsIPOrApp)
+		}
+
+		if len(grant.IPs) > 0 {
+			errs = append(errs, ErrGrantIPUnsupported)
+		}
+
+		for capName := range grant.App {
+			if strings.TrimSpace(string(capName)) == "" {
+				errs = append(errs, ErrEmptyCapabilityName)
+			}
+		}
+
+		for _, src := range grant.Sources {
+			switch src := src.(type) {
+			case *Host:
+				h := src
+				if !p.Hosts.exist(*h) {
+					errs = append(errs, fmt.Errorf("%w: %q", ErrHostNotDefined, *h))
+				}
+			case *AutoGroup:
+				ag := src
+
+				err := validateAutogroupSupported(ag)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+
+				err = validateAutogroupForSrc(ag)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			case *Group:
+				g := src
+
+				err := p.Groups.Contains(g)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			case *Tag:
+				tagOwner := src
+
+				err := p.TagOwners.Contains(tagOwner)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+
+		for _, dst := range grant.Destinations {
+			switch dst := dst.(type) {
+			case *Host:
+				if !p.Hosts.exist(*dst) {
+					errs = append(errs, fmt.Errorf("%w: %q", ErrHostNotDefined, *dst))
+				}
+			case *AutoGroup:
+				err := validateAutogroupSupported(dst)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+
+				err = validateAutogroupForDst(dst)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			case *Group:
+				err := p.Groups.Contains(dst)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			case *Tag:
+				err := p.TagOwners.Contains(dst)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			}
 		}
 	}
 

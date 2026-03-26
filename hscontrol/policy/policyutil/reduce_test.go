@@ -127,7 +127,7 @@ func TestReduceFilterRules(t *testing.T) {
 			name: "host1-can-reach-host2-no-rules",
 			pol: `
 {
-  "acls": [
+	"acls": [
     {
       "action": "accept",
       "proto": "",
@@ -816,4 +816,51 @@ func TestReduceFilterRules(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestReduceFilterRules_CapGrant(t *testing.T) {
+	node := (&types.Node{
+		IPv4: ap("100.64.0.3"),
+	}).View()
+
+	rules := []tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.64.0.2/32"},
+			CapGrant: []tailcfg.CapGrant{
+				{
+					Dsts: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.3/32"),
+						netip.MustParsePrefix("100.64.0.4/32"),
+					},
+					CapMap: tailcfg.PeerCapMap{
+						tailcfg.PeerCapabilityRelay: []tailcfg.RawMessage{
+							tailcfg.RawMessage("{}"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := policyutil.ReduceFilterRules(node, rules)
+
+	want := []tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.64.0.2/32"},
+			CapGrant: []tailcfg.CapGrant{
+				{
+					Dsts: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.3/32"),
+					},
+					CapMap: tailcfg.PeerCapMap{
+						tailcfg.PeerCapabilityRelay: []tailcfg.RawMessage{
+							tailcfg.RawMessage("{}"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	require.Equal(t, want, got)
 }

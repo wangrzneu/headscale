@@ -3088,3 +3088,106 @@ func TestGroupSourcesByUser(t *testing.T) {
 		})
 	}
 }
+
+func TestCompileGrantRules(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "alice"},
+		{Model: gorm.Model{ID: 2}, Name: "bob"},
+	}
+
+	relayNode := &types.Node{
+		ID:   1,
+		IPv4: ap("100.64.0.3"),
+		User: &users[0],
+		Tags: []string{"tag:relay"},
+	}
+	clientNode := &types.Node{
+		ID:   2,
+		IPv4: ap("100.64.0.2"),
+		User: &users[1],
+	}
+
+	policy := `
+{
+  "tagOwners": {
+    "tag:relay": ["alice@"]
+  },
+  "grants": [
+    {
+      "src": ["bob@"],
+      "dst": ["tag:relay"],
+      "app": {
+        "tailscale.com/cap/relay": [{}]
+      }
+    }
+  ]
+}
+`
+
+	pm, err := NewPolicyManager([]byte(policy), users, types.Nodes{relayNode, clientNode}.ViewSlice())
+	require.NoError(t, err)
+
+	gotRelay, err := pm.FilterForNode(relayNode.View())
+	require.NoError(t, err)
+
+	wantRelay := []tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.64.0.2/32"},
+			CapGrant: []tailcfg.CapGrant{
+				{
+					Dsts: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.3/32"),
+					},
+					CapMap: tailcfg.PeerCapMap{
+						tailcfg.PeerCapabilityRelay: []tailcfg.RawMessage{
+							tailcfg.RawMessage("{}"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	gotClient, err := pm.FilterForNode(clientNode.View())
+	require.NoError(t, err)
+
+	wantClient := []tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.64.0.3/32"},
+			CapGrant: []tailcfg.CapGrant{
+				{
+					Dsts: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.2/32"),
+					},
+					CapMap: tailcfg.PeerCapMap{
+						tailcfg.PeerCapabilityRelayTarget: {},
+					},
+				},
+			},
+		},
+	}
+
+	require.Equal(t, wantRelay, gotRelay)
+	require.Equal(t, wantClient, gotClient)
+}
+
+func TestGrantWithIPIsRejected(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "alice"},
+	}
+
+	policy := `
+{
+  "grants": [
+    {
+      "src": ["alice@"],
+      "dst": ["*"],
+      "ip": [{"proto": "tcp"}]
+    }
+  ]
+}
+`
+
+	_, err := NewPolicyManager([]byte(policy), users, types.Nodes{}.ViewSlice())
+	require.ErrorIs(t, err, ErrGrantIPUnsupported)
+}

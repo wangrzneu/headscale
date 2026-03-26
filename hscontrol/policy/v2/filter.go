@@ -28,7 +28,7 @@ func (pol *Policy) compileFilterRules(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) ([]tailcfg.FilterRule, error) {
-	if pol == nil || pol.ACLs == nil {
+	if pol == nil || (len(pol.ACLs) == 0 && len(pol.Grants) == 0) {
 		return tailcfg.FilterAllowAll, nil
 	}
 
@@ -105,6 +105,13 @@ func (pol *Policy) compileFilterRules(
 		})
 	}
 
+	grantRules, err := pol.compileGrantRules(users, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	rules = append(rules, grantRules...)
+
 	return mergeFilterRules(rules), nil
 }
 
@@ -114,7 +121,7 @@ func (pol *Policy) compileFilterRulesForNode(
 	node types.NodeView,
 	nodes views.Slice[types.NodeView],
 ) ([]tailcfg.FilterRule, error) {
-	if pol == nil {
+	if pol == nil || (len(pol.ACLs) == 0 && len(pol.Grants) == 0) {
 		return tailcfg.FilterAllowAll, nil
 	}
 
@@ -138,7 +145,117 @@ func (pol *Policy) compileFilterRulesForNode(
 		}
 	}
 
+	grantRules, err := pol.compileGrantRules(users, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	rules = append(rules, grantRules...)
+
 	return mergeFilterRules(rules), nil
+}
+
+func (pol *Policy) compileGrantRules(
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) ([]tailcfg.FilterRule, error) {
+	if pol == nil || len(pol.Grants) == 0 {
+		return nil, nil
+	}
+
+	var rules []tailcfg.FilterRule
+
+	for _, grant := range pol.Grants {
+		if len(grant.App) == 0 {
+			continue
+		}
+
+		srcIPs, err := grant.Sources.Resolve(pol, users, nodes)
+		if err != nil {
+			log.Trace().Caller().Err(err).Msg("resolving grant source ips")
+		}
+
+		if srcIPs == nil || len(srcIPs.Prefixes()) == 0 {
+			continue
+		}
+
+		var dsts []netip.Prefix
+		for _, dst := range grant.Destinations {
+			ips, err := dst.Resolve(pol, users, nodes)
+			if err != nil {
+				log.Trace().Caller().Err(err).Msg("resolving grant destination ips")
+			}
+
+			if ips == nil {
+				continue
+			}
+
+			dsts = append(dsts, ips.Prefixes()...)
+		}
+
+		if len(dsts) == 0 {
+			continue
+		}
+
+		slices.SortFunc(dsts, netip.Prefix.Compare)
+		dsts = slices.Compact(dsts)
+
+		capMap := make(tailcfg.PeerCapMap, len(grant.App))
+		for capName, vals := range grant.App {
+			capMap[capName] = slices.Clone(vals)
+		}
+
+		rules = append(rules, tailcfg.FilterRule{
+			SrcIPs: ipSetToPrefixStringList(srcIPs),
+			CapGrant: []tailcfg.CapGrant{
+				{
+					Dsts:   dsts,
+					CapMap: capMap,
+				},
+			},
+		})
+
+		if relayTargetRule := synthesizeRelayTargetRule(srcIPs, dsts, capMap); relayTargetRule != nil {
+			rules = append(rules, *relayTargetRule)
+		}
+	}
+
+	return rules, nil
+}
+
+func synthesizeRelayTargetRule(
+	srcIPs *netipx.IPSet,
+	dsts []netip.Prefix,
+	capMap tailcfg.PeerCapMap,
+) *tailcfg.FilterRule {
+	if _, ok := capMap[tailcfg.PeerCapabilityRelay]; !ok {
+		return nil
+	}
+
+	// The Tailscale client expects candidate relay servers to have
+	// relay-target capability towards clients, in addition to clients
+	// having relay capability towards the relay server.
+	reverseCapMap := tailcfg.PeerCapMap{
+		tailcfg.PeerCapabilityRelayTarget: {},
+	}
+
+	return &tailcfg.FilterRule{
+		SrcIPs: prefixesToStrings(dsts),
+		CapGrant: []tailcfg.CapGrant{
+			{
+				Dsts:   srcIPs.Prefixes(),
+				CapMap: reverseCapMap,
+			},
+		},
+	}
+}
+
+func prefixesToStrings(prefixes []netip.Prefix) []string {
+	out := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		out = append(out, prefix.String())
+	}
+	return out
 }
 
 // compileACLWithAutogroupSelf compiles a single ACL rule, handling
@@ -722,7 +839,12 @@ func filterRuleKey(rule tailcfg.FilterRule) string {
 		protoStrs[i] = strconv.Itoa(p)
 	}
 
-	return srcKey + "|" + strings.Join(protoStrs, ",")
+	ruleType := "dst"
+	if len(rule.CapGrant) > 0 {
+		ruleType = "cap"
+	}
+
+	return srcKey + "|" + strings.Join(protoStrs, ",") + "|" + ruleType
 }
 
 // mergeFilterRules merges rules with identical SrcIPs and IPProto by combining
@@ -739,8 +861,9 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 		key := filterRuleKey(rule)
 
 		if idx, exists := keyToIdx[key]; exists {
-			// Merge: append DstPorts to existing rule
+			// Merge: append rule payload to existing rule.
 			result[idx].DstPorts = append(result[idx].DstPorts, rule.DstPorts...)
+			result[idx].CapGrant = append(result[idx].CapGrant, rule.CapGrant...)
 		} else {
 			// New unique combination
 			keyToIdx[key] = len(result)
@@ -748,6 +871,7 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 				SrcIPs:   rule.SrcIPs,
 				DstPorts: slices.Clone(rule.DstPorts),
 				IPProto:  rule.IPProto,
+				CapGrant: slices.Clone(rule.CapGrant),
 			})
 		}
 	}
